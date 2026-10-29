@@ -1,8 +1,10 @@
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
+const { randomUUID } = require("crypto");
 const { getStoredUploadFilename, resolveUploadPath } = require("./privateMedia");
 const { isSupportedImageBuffer } = require("./imageValidation");
+const { createProfilePublicId, getProfileAssetPublicId, PROFILE_FOLDER } = require("./profilePhotoCloudinary");
 
 const extensionsByType = {
     "image/jpeg": new Set([".jpg", ".jpeg"]),
@@ -48,7 +50,36 @@ async function discardUpload(file, fileSystem = fs) {
     }
 }
 
-function createProfilePhotoRouter({ authMiddleware, upload, User, Message, UploadedFile, ConversationWallpaper, io, uploadFolder, fileSystem = fs }) {
+async function destroyCloudinaryProfileAsset(cloudinary, publicId, userId) {
+    const ownerPrefix = `${PROFILE_FOLDER}/${userId}/`;
+    const assetId = typeof publicId === "string" && publicId.startsWith(ownerPrefix)
+        ? publicId.slice(ownerPrefix.length)
+        : "";
+    if (!cloudinary?.uploader?.destroy || createProfilePublicId(userId, assetId) !== publicId) return;
+    try {
+        await cloudinary.uploader.destroy(publicId, { resource_type: "image", invalidate: true });
+    } catch (error) {
+        console.warn("Cloudinary profile photo cleanup skipped", error.code || error.name || "unknown");
+    }
+}
+
+async function removePreviousProfilePhoto({ fileUrl, userId, User, Message, UploadedFile, ConversationWallpaper, uploadFolder, fileSystem, cloudinary, cloudName }) {
+    if (getStoredUploadFilename(fileUrl)) {
+        await removeUploadIfUnreferenced({ fileUrl, userId, User, Message, UploadedFile, ConversationWallpaper, uploadFolder, fileSystem });
+        return;
+    }
+
+    const publicId = getProfileAssetPublicId(fileUrl, cloudName, userId);
+    if (!publicId) return;
+    try {
+        if (await User.exists({ profilePhoto: fileUrl, _id: { $ne: userId } })) return;
+        await destroyCloudinaryProfileAsset(cloudinary, publicId, userId);
+    } catch (error) {
+        console.warn("Previous profile photo cleanup skipped", error.code || error.name || "unknown");
+    }
+}
+
+function createProfilePhotoRouter({ authMiddleware, upload, User, Message, UploadedFile, ConversationWallpaper, io, uploadFolder, fileSystem = fs, cloudinary, cloudName, requireCloudinary = false }) {
     const router = express.Router();
 
     router.put("/", authMiddleware, upload, async (req, res) => {
@@ -57,8 +88,16 @@ function createProfilePhotoRouter({ authMiddleware, upload, User, Message, Uploa
             return res.status(400).json({ message: "Choose a valid JPEG, PNG, or WebP image." });
         }
 
+        let user;
+        let previousPhoto;
+        let uploadedPublicId;
+        let keepLocalUpload = false;
         try {
-            const user = await User.findOne({
+            if (requireCloudinary && !cloudinary) {
+                return res.status(503).json({ message: "Profile photo storage is not configured." });
+            }
+
+            user = await User.findOne({
                 _id: req.user.userId,
                 isDeleted: { $ne: true },
                 isDeleting: { $ne: true }
@@ -68,10 +107,29 @@ function createProfilePhotoRouter({ authMiddleware, upload, User, Message, Uploa
                 return res.status(404).json({ message: "User not found" });
             }
 
-            const previousPhoto = user.profilePhoto;
-            const profilePhoto = `/uploads/${req.file.filename}`;
+            previousPhoto = user.profilePhoto;
+            let profilePhoto;
+            if (cloudinary) {
+                const userId = user._id.toString();
+                const assetId = randomUUID().replace(/-/g, "");
+                uploadedPublicId = createProfilePublicId(userId, assetId);
+                const uploaded = await cloudinary.uploader.upload(req.file.path, {
+                    folder: `${PROFILE_FOLDER}/${userId}`,
+                    public_id: assetId,
+                    resource_type: "image",
+                    overwrite: false
+                });
+                profilePhoto = uploaded?.secure_url;
+                if (getProfileAssetPublicId(profilePhoto, cloudName, userId) !== uploadedPublicId) {
+                    throw new Error("Cloudinary returned an invalid profile photo reference.");
+                }
+            } else {
+                profilePhoto = `/uploads/${req.file.filename}`;
+            }
             user.profilePhoto = profilePhoto;
             await user.save();
+            keepLocalUpload = !cloudinary;
+            uploadedPublicId = null;
 
             try {
                 io.emit("profilePhotoUpdated", {
@@ -81,7 +139,7 @@ function createProfilePhotoRouter({ authMiddleware, upload, User, Message, Uploa
             } catch (error) {
                 console.warn("Profile photo update broadcast skipped", error.code || error.name || "unknown");
             }
-            await removeUploadIfUnreferenced({
+            await removePreviousProfilePhoto({
                 fileUrl: previousPhoto,
                 userId: user._id,
                 User,
@@ -89,19 +147,26 @@ function createProfilePhotoRouter({ authMiddleware, upload, User, Message, Uploa
                 UploadedFile,
                 ConversationWallpaper,
                 uploadFolder,
-                fileSystem
+                fileSystem,
+                cloudinary,
+                cloudName
             });
             return res.json({ message: "Profile photo updated", profilePhoto });
         } catch (error) {
-            await discardUpload(req.file, fileSystem);
+            if (user && previousPhoto !== undefined) user.profilePhoto = previousPhoto;
+            if (uploadedPublicId) await destroyCloudinaryProfileAsset(cloudinary, uploadedPublicId, user?._id?.toString() || req.user.userId);
             console.error("Profile photo update failed", error.code || error.name || "unknown");
             return res.status(500).json({ message: "Profile photo could not be updated." });
+        } finally {
+            if (cloudinary || !keepLocalUpload) await discardUpload(req.file, fileSystem);
         }
     });
 
     router.delete("/", authMiddleware, async (req, res) => {
+        let user;
+        let previousPhoto;
         try {
-            const user = await User.findOne({
+            user = await User.findOne({
                 _id: req.user.userId,
                 isDeleted: { $ne: true },
                 isDeleting: { $ne: true }
@@ -109,7 +174,7 @@ function createProfilePhotoRouter({ authMiddleware, upload, User, Message, Uploa
             if (!user) return res.status(404).json({ message: "User not found" });
             if (!user.profilePhoto) return res.status(400).json({ message: "No profile photo to remove" });
 
-            const previousPhoto = user.profilePhoto;
+            previousPhoto = user.profilePhoto;
             user.profilePhoto = null;
             await user.save();
             try {
@@ -117,7 +182,7 @@ function createProfilePhotoRouter({ authMiddleware, upload, User, Message, Uploa
             } catch (error) {
                 console.warn("Profile photo removal broadcast skipped", error.code || error.name || "unknown");
             }
-            await removeUploadIfUnreferenced({
+            await removePreviousProfilePhoto({
                 fileUrl: previousPhoto,
                 userId: user._id,
                 User,
@@ -125,10 +190,13 @@ function createProfilePhotoRouter({ authMiddleware, upload, User, Message, Uploa
                 UploadedFile,
                 ConversationWallpaper,
                 uploadFolder,
-                fileSystem
+                fileSystem,
+                cloudinary,
+                cloudName
             });
             return res.json({ message: "Profile photo removed successfully" });
         } catch (error) {
+            if (user && previousPhoto !== undefined) user.profilePhoto = previousPhoto;
             console.error("Profile photo removal failed", error.code || error.name || "unknown");
             return res.status(500).json({ message: "Profile photo could not be removed." });
         }
@@ -137,4 +205,4 @@ function createProfilePhotoRouter({ authMiddleware, upload, User, Message, Uploa
     return router;
 }
 
-module.exports = { createProfilePhotoRouter, isSupportedImageBuffer, removeUploadIfUnreferenced, validateUploadedImage };
+module.exports = { createProfilePhotoRouter, destroyCloudinaryProfileAsset, isSupportedImageBuffer, removeUploadIfUnreferenced, removePreviousProfilePhoto, validateUploadedImage };

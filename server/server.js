@@ -3,6 +3,7 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const { randomUUID } = require("crypto");
 require("dotenv").config();
+const { cloudinary, cloudName } = require("./cloudinary");
 const User = require("./models/User");
 const Message = require("./models/message");
 const MessageReport = require("./models/messageReport");
@@ -33,6 +34,7 @@ const { createPrivacyPreferencesRouter, sanitizeGroupPresence, sanitizePresence,
 const { createUserDirectoryRouter } = require("./userDirectory");
 const { parseEventDate } = require("./groupEventDate");
 const { getCallAvailability } = require("./callAvailability");
+const { isGroupMember, isGroupAdmin, canRemoveGroupMember, getLeaveGroupUpdate } = require("./groupManagement");
 
 async function getGroupEventDetails(eventId) {
     const event = await GroupEvent.findById(eventId).lean();
@@ -72,6 +74,18 @@ async function saveMessageWithUploadedFile(message, ownerId) {
         await releaseUploadedAttachment(UploadedFile, message.fileUrl, ownerId, message._id);
         throw error;
     }
+}
+
+async function deleteGroupContent(groupId) {
+    const messageIds = await Message.find({ groupId }).distinct("_id");
+    const eventIds = await GroupEvent.find({ groupId }).distinct("_id");
+    await Promise.all([
+        MessageReport.deleteMany({ messageId: { $in: messageIds } }),
+        UploadedFile.deleteMany({ messageId: { $in: messageIds } }),
+        Message.deleteMany({ groupId }),
+        GroupEventRsvp.deleteMany({ eventId: { $in: eventIds } }),
+        GroupEvent.deleteMany({ groupId })
+    ]);
 }
 
 // Socket.IO imports
@@ -740,6 +754,79 @@ app.put("/groups/:groupId/members", authMiddleware, async (req, res) => {
 
 });
 
+app.delete("/groups/:groupId/members/me", authMiddleware, async (req, res) => {
+    const { groupId } = req.params;
+    const userId = req.user.userId;
+    if (!mongoose.Types.ObjectId.isValid(groupId)) return res.status(400).json({ message: "Invalid group ID" });
+    try {
+        const group = await Group.findById(groupId);
+        if (!group || !isGroupMember(group, userId)) return res.status(404).json({ message: "Group not found" });
+        const formerMemberIds = group.members.map((id) => id.toString());
+        const update = getLeaveGroupUpdate(group, userId);
+        if (update.deleteGroup) {
+            await deleteGroupContent(groupId);
+            await Group.deleteOne({ _id: groupId });
+            formerMemberIds.forEach((memberId) => io.to(memberId).emit("groupDeleted", { groupId }));
+            return res.json({ deleted: true, groupId });
+        }
+        group.members = update.members;
+        group.admin = update.admin;
+        await group.save();
+        const updatedGroup = await Group.findById(groupId).populate("members", "username profilePhoto isOnline showOnlineStatus");
+        io.to(userId).emit("groupRemoved", { groupId });
+        for (const member of updatedGroup.members) {
+            const memberId = member._id.toString();
+            io.to(memberId).emit("groupMembersUpdated", sanitizeGroupPresence(updatedGroup, memberId));
+        }
+        return res.json({ deleted: false, groupId, group: sanitizeGroupPresence(updatedGroup, update.admin.toString()) });
+    } catch (error) {
+        console.error("Leave group error:", error);
+        return res.status(500).json({ message: "Could not leave group" });
+    }
+});
+
+app.delete("/groups/:groupId/members/:memberId", authMiddleware, async (req, res) => {
+    const { groupId, memberId } = req.params;
+    if (![groupId, memberId].every(mongoose.Types.ObjectId.isValid)) return res.status(400).json({ message: "Invalid group or member ID" });
+    try {
+        const group = await Group.findById(groupId);
+        if (!group) return res.status(404).json({ message: "Group not found" });
+        if (!isGroupAdmin(group, req.user.userId)) return res.status(403).json({ message: "Only the group admin can remove members" });
+        if (memberId === req.user.userId) return res.status(400).json({ message: "Use leave group to remove yourself" });
+        if (!canRemoveGroupMember(group, req.user.userId, memberId)) return res.status(404).json({ message: "Member not found in this group" });
+        group.members = group.members.filter((id) => id.toString() !== memberId);
+        await group.save();
+        const updatedGroup = await Group.findById(groupId).populate("members", "username profilePhoto isOnline showOnlineStatus");
+        io.to(memberId).emit("groupRemoved", { groupId });
+        for (const member of updatedGroup.members) {
+            const recipientId = member._id.toString();
+            io.to(recipientId).emit("groupMembersUpdated", sanitizeGroupPresence(updatedGroup, recipientId));
+        }
+        return res.json({ group: sanitizeGroupPresence(updatedGroup, req.user.userId) });
+    } catch (error) {
+        console.error("Remove group member error:", error);
+        return res.status(500).json({ message: "Could not remove member" });
+    }
+});
+
+app.delete("/groups/:groupId", authMiddleware, async (req, res) => {
+    const { groupId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(groupId)) return res.status(400).json({ message: "Invalid group ID" });
+    try {
+        const group = await Group.findById(groupId).select("members admin");
+        if (!group) return res.status(404).json({ message: "Group not found" });
+        if (!isGroupAdmin(group, req.user.userId)) return res.status(403).json({ message: "Only the group admin can delete this group" });
+        const memberIds = group.members.map((id) => id.toString());
+        await deleteGroupContent(groupId);
+        await Group.deleteOne({ _id: groupId });
+        memberIds.forEach((memberId) => io.to(memberId).emit("groupDeleted", { groupId }));
+        return res.json({ deleted: true, groupId });
+    } catch (error) {
+        console.error("Delete group error:", error);
+        return res.status(500).json({ message: "Could not delete group" });
+    }
+});
+
 app.get("/groups/:groupId/messages", authMiddleware, async (req, res) => {
 
     try {
@@ -843,7 +930,7 @@ app.get(
 app.get(
     "/media/profiles/:userId",
     authMiddleware,
-    createProfileMediaHandler({ User, uploadFolder })
+    createProfileMediaHandler({ User, uploadFolder, cloudName })
 );
 
 app.use("/profile/photo", createProfilePhotoRouter({
@@ -854,7 +941,10 @@ app.use("/profile/photo", createProfilePhotoRouter({
     UploadedFile,
     ConversationWallpaper,
     io,
-    uploadFolder
+    uploadFolder,
+    cloudinary,
+    cloudName,
+    requireCloudinary: process.env.NODE_ENV === "production"
 }));
 
 app.use("/conversations", createConversationWallpaperRouter({

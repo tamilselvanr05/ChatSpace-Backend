@@ -9,6 +9,7 @@ const {
     canReadMessageMedia,
     claimUploadedAttachment,
     createMessageMediaHandler,
+    createProfileMediaHandler,
     getStoredUploadFilename,
     parseByteRange,
     resolveUploadPath
@@ -26,6 +27,137 @@ test("stored upload names reject traversal and remain inside the upload director
     assert.equal(getStoredUploadFilename("/uploads/subdir/photo.png"), null);
     assert.equal(getStoredUploadFilename("/uploads/..\\secret"), null);
     assert.equal(resolveUploadPath("C:/uploads", "../secret"), null);
+});
+
+test("profile media returns 404 for a missing stored file or invalid database reference", async () => {
+    const uploadFolder = await fs.mkdtemp(path.join(os.tmpdir(), "chatspace-profile-media-test-"));
+    try {
+        const makeResponse = () => ({
+            statusCode: 200,
+            status(code) { this.statusCode = code; return this; },
+            json(body) { this.body = body; return this; },
+            set() { return this; }
+        });
+        const handler = createProfileMediaHandler({
+            User: {
+                findOne() {
+                    return { select: () => ({ lean: async () => ({ profilePhoto: "/uploads/missing.jpg" }) }) };
+                }
+            },
+            uploadFolder
+        });
+        const response = makeResponse();
+        await handler({ params: { userId: USER_A }, user: { userId: USER_A } }, response);
+        assert.equal(response.statusCode, 404);
+        assert.deepEqual(response.body, { message: "Media not found" });
+
+        const invalidHandler = createProfileMediaHandler({
+            User: {
+                findOne() {
+                    return { select: () => ({ lean: async () => ({ profilePhoto: "https://old-host/photo.jpg" }) }) };
+                }
+            },
+            uploadFolder
+        });
+        const invalidResponse = makeResponse();
+        await invalidHandler({ params: { userId: USER_A }, user: { userId: USER_A } }, invalidResponse);
+        assert.equal(invalidResponse.statusCode, 404);
+    } finally {
+        await fs.rm(uploadFolder, { recursive: true, force: true });
+    }
+});
+
+test("authenticated profile media serves the file referenced by the user's stored profilePhoto", async (t) => {
+    const uploadFolder = await fs.mkdtemp(path.join(os.tmpdir(), "chatspace-profile-media-test-"));
+    const server = express();
+    const photoBytes = Buffer.from("profile-photo-bytes");
+    await fs.writeFile(path.join(uploadFolder, "avatar.jpg"), photoBytes);
+    server.get("/media/profiles/:userId", (req, _res, next) => {
+        req.user = { userId: USER_A };
+        next();
+    }, createProfileMediaHandler({
+        User: {
+            findOne(filter) {
+                assert.equal(filter._id, USER_A);
+                return { select: () => ({ lean: async () => ({ profilePhoto: "/uploads/avatar.jpg" }) }) };
+            }
+        },
+        uploadFolder
+    }));
+    const listener = server.listen(0);
+    await new Promise((resolve) => listener.once("listening", resolve));
+    t.after(async () => {
+        listener.closeAllConnections();
+        await new Promise((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+        await fs.rm(uploadFolder, { recursive: true, force: true });
+    });
+
+    const response = await fetch(`http://127.0.0.1:${listener.address().port}/media/profiles/${USER_A}`);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "image/jpeg");
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), photoBytes);
+});
+
+test("authenticated profile media continues to serve legacy local upload references", async (t) => {
+    const uploadFolder = await fs.mkdtemp(path.join(os.tmpdir(), "chatspace-profile-legacy-test-"));
+    const photoBytes = Buffer.from("legacy-profile-photo");
+    await fs.writeFile(path.join(uploadFolder, "legacy.jpg"), photoBytes);
+    const server = express();
+    server.get("/media/profiles/:userId", (req, _res, next) => {
+        req.user = { userId: USER_A };
+        next();
+    }, createProfileMediaHandler({
+        User: { findOne: () => ({ select: () => ({ lean: async () => ({ profilePhoto: "/uploads/legacy.jpg" }) }) }) },
+        uploadFolder
+    }));
+    const listener = server.listen(0);
+    await new Promise((resolve) => listener.once("listening", resolve));
+    t.after(async () => {
+        listener.closeAllConnections();
+        await new Promise((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+        await fs.rm(uploadFolder, { recursive: true, force: true });
+    });
+
+    const response = await fetch(`http://127.0.0.1:${listener.address().port}/media/profiles/${USER_A}`);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "image/jpeg");
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), photoBytes);
+});
+
+test("authenticated profile media proxies a Cloudinary URL while preserving the protected route", async (t) => {
+    const cloudPhoto = `https://res.cloudinary.com/demo-cloud/image/upload/v123/chatspace/profiles/${USER_A}/0123456789abcdef0123456789abcdef.jpg`;
+    const photoBytes = Buffer.from("cloudinary-profile-photo");
+    const server = express();
+    server.get("/media/profiles/:userId", (req, _res, next) => {
+        req.user = { userId: USER_A };
+        next();
+    }, createProfileMediaHandler({
+        User: {
+            findOne(filter) {
+                assert.equal(filter._id, USER_A);
+                return { select: () => ({ lean: async () => ({ profilePhoto: cloudPhoto }) }) };
+            }
+        },
+        uploadFolder: os.tmpdir(),
+        cloudName: "demo-cloud",
+        fetchImpl: async (url, options) => {
+            assert.equal(url, cloudPhoto);
+            assert.deepEqual(options, { redirect: "error" });
+            return new Response(photoBytes, { status: 200, headers: { "content-type": "image/jpeg" } });
+        }
+    }));
+    const listener = server.listen(0);
+    await new Promise((resolve) => listener.once("listening", resolve));
+    t.after(async () => {
+        listener.closeAllConnections();
+        await new Promise((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+    });
+
+    const response = await fetch(`http://127.0.0.1:${listener.address().port}/media/profiles/${USER_A}`);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("cache-control"), "private, no-store");
+    assert.equal(response.headers.get("content-type"), "image/jpeg");
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), photoBytes);
 });
 
 test("new attachment references can only be claimed once by their authenticated uploader", async () => {

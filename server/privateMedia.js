@@ -1,5 +1,7 @@
 const fs = require("fs");
 const path = require("path");
+const { Readable } = require("stream");
+const { getProfileAssetPublicId } = require("./profilePhotoCloudinary");
 
 function idString(value) {
     return value?._id?.toString?.() || value?.toString?.() || "";
@@ -162,7 +164,7 @@ function createMessageMediaHandler({ Message, Group, UploadedFile, uploadFolder,
     };
 }
 
-function createProfileMediaHandler({ User, uploadFolder, fileSystem = fs }) {
+function createProfileMediaHandler({ User, uploadFolder, fileSystem = fs, cloudName, fetchImpl = globalThis.fetch }) {
     return async (req, res) => {
         const targetUserId = req.params.userId;
         if (!/^[a-f\d]{24}$/i.test(targetUserId || "") || !req.user?.userId) {
@@ -171,7 +173,43 @@ function createProfileMediaHandler({ User, uploadFolder, fileSystem = fs }) {
         try {
             const user = await User.findOne({ _id: targetUserId, isDeleted: { $ne: true }, isDeleting: { $ne: true } })
                 .select("profilePhoto").lean();
-            const filename = getStoredUploadFilename(user?.profilePhoto);
+            const profilePhoto = user?.profilePhoto;
+            if (typeof profilePhoto === "string" && profilePhoto.startsWith("https://")) {
+                if (!getProfileAssetPublicId(profilePhoto, cloudName, targetUserId) || typeof fetchImpl !== "function") {
+                    return res.status(404).json({ message: "Media not found" });
+                }
+                let cloudResponse;
+                try {
+                    cloudResponse = await fetchImpl(profilePhoto, { redirect: "error" });
+                } catch {
+                    return res.status(502).json({ message: "Media could not be loaded" });
+                }
+                if (!cloudResponse.ok || !cloudResponse.body) {
+                    const status = [403, 404].includes(cloudResponse.status) ? 404 : 502;
+                    return res.status(status).json({ message: status === 404 ? "Media not found" : "Media could not be loaded" });
+                }
+                const contentType = (cloudResponse.headers.get("content-type") || "").split(";", 1)[0].toLowerCase();
+                if (!["image/jpeg", "image/png", "image/webp"].includes(contentType)) {
+                    return res.status(404).json({ message: "Media not found" });
+                }
+                res.set({
+                    "Cache-Control": "private, no-store",
+                    "Content-Security-Policy": "default-src 'none'; sandbox",
+                    "Content-Type": contentType,
+                    "X-Content-Type-Options": "nosniff"
+                });
+                const contentLength = cloudResponse.headers.get("content-length");
+                if (contentLength && /^\d+$/.test(contentLength)) res.set("Content-Length", contentLength);
+                res.status(200);
+                const stream = Readable.fromWeb(cloudResponse.body);
+                stream.on("error", () => {
+                    if (!res.headersSent) res.status(502).json({ message: "Media could not be loaded" });
+                    else res.destroy();
+                });
+                return stream.pipe(res);
+            }
+
+            const filename = getStoredUploadFilename(profilePhoto);
             const filePath = filename && resolveUploadPath(uploadFolder, filename);
             if (!filename || !filePath) return res.status(404).json({ message: "Media not found" });
 
